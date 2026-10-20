@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -41,6 +42,7 @@ type Inbound struct {
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
 	transport                adapter.V2RayServerTransport
 	references               []string
+	userconns                sync.Map
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TrojanInboundOptions) (adapter.Inbound, error) {
@@ -117,6 +119,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Listen:            options.ListenOptions,
 		ConnectionHandler: inbound,
 	})
+	inbound.userconns = sync.Map{}
 	return inbound, nil
 }
 
@@ -178,6 +181,10 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		}
 		conn = tlsConn
 	}
+	h.userconns.Store(conn, metadata.User)
+	onClose = N.AppendClose(onClose, func(err error) {
+		h.userconns.Delete(conn)
+	})
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
