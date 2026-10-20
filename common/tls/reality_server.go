@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
-	"fmt"
 	"net"
 	"time"
 
@@ -20,18 +19,18 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 
-	utls "github.com/metacubex/utls"
+	"github.com/xtls/reality"
 )
 
 var _ ServerConfigCompat = (*RealityServerConfig)(nil)
 
 type RealityServerConfig struct {
-	config           *utls.RealityConfig
+	config           *reality.Config
 	handshakeTimeout time.Duration
 }
 
 func NewRealityServer(ctx context.Context, logger log.ContextLogger, options option.InboundTLSOptions) (ServerConfig, error) {
-	var tlsConfig utls.RealityConfig
+	var tlsConfig reality.Config
 
 	if options.CertificateProvider != nil {
 		return nil, E.New("certificate_provider is unavailable in reality")
@@ -84,11 +83,7 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 	}
 
 	tlsConfig.SessionTicketsDisabled = true
-	tlsConfig.Log = func(format string, v ...any) {
-		if logger != nil {
-			logger.Trace(fmt.Sprintf(format, v...))
-		}
-	}
+	tlsConfig.Xver = options.Reality.Xver
 	tlsConfig.Type = N.NetworkTCP
 	tlsConfig.Dest = options.Reality.Handshake.ServerOptions.Build().String()
 
@@ -142,15 +137,7 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		handshakeTimeout: handshakeTimeout,
 	}
 	if options.KernelTx || options.KernelRx {
-		if !C.IsLinux {
-			return nil, E.New("kTLS is only supported on Linux")
-		}
-		config = &KTlSServerConfig{
-			ServerConfig: config,
-			logger:       logger,
-			kernelTx:     options.KernelTx,
-			kernelRx:     options.KernelRx,
-		}
+		return nil, E.New("kTLS is unavailable in reality")
 	}
 	return config, nil
 }
@@ -188,6 +175,7 @@ func (c *RealityServerConfig) Client(conn net.Conn) (Conn, error) {
 }
 
 func (c *RealityServerConfig) Start() error {
+	go reality.DetectPostHandshakeRecordsLens(c.config)
 	return nil
 }
 
@@ -200,7 +188,7 @@ func (c *RealityServerConfig) Server(conn net.Conn) (Conn, error) {
 }
 
 func (c *RealityServerConfig) ServerHandshake(ctx context.Context, conn net.Conn) (Conn, error) {
-	tlsConn, err := utls.RealityServer(ctx, conn, c.config)
+	tlsConn, err := reality.Server(ctx, conn, c.config)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +205,7 @@ func (c *RealityServerConfig) Clone() Config {
 var _ Conn = (*realityConnWrapper)(nil)
 
 type realityConnWrapper struct {
-	*utls.Conn
+	*reality.Conn
 }
 
 func (c *realityConnWrapper) ConnectionState() ConnectionState {
