@@ -40,6 +40,8 @@ type InboundManager interface {
 	Lifecycle
 	Inbounds() []Inbound
 	Get(tag string) (Inbound, bool)
+	// for v2bx
+	Remove(tag string) error
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
 }
 

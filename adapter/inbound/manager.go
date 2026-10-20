@@ -17,6 +17,8 @@ type Manager struct {
 	access       sync.Mutex
 	inbounds     []adapter.Inbound
 	inboundByTag map[string]adapter.Inbound
+	scope        *adapter.Scope
+	started      bool
 }
 
 func NewManager(registry adapter.InboundRegistry, endpoint adapter.EndpointManager) *Manager {
@@ -29,6 +31,7 @@ func NewManager(registry adapter.InboundRegistry, endpoint adapter.EndpointManag
 
 func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	m.access.Lock()
+	m.scope = scope
 	inbounds := m.inbounds
 	m.access.Unlock()
 	for _, inbound := range inbounds {
@@ -37,6 +40,11 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if err != nil {
 			return err
 		}
+	}
+	if stage == adapter.StartStateStarted {
+		m.access.Lock()
+		m.started = true
+		m.access.Unlock()
 	}
 	return nil
 }
@@ -64,9 +72,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
-	_, loaded := m.inboundByTag[tag]
+	existsInbound, loaded := m.inboundByTag[tag]
 	if loaded {
-		return E.New("duplicate inbound tag: ", tag)
+		if !m.started {
+			return E.New("duplicate inbound tag: ", tag)
+		}
+		err = m.removeInbound(existsInbound)
+		if err != nil {
+			return E.Cause(err, "close ", inboundName(existsInbound))
+		}
+	}
+	if m.started {
+		err = m.startInbound(inbound)
+		if err != nil {
+			return err
+		}
 	}
 	m.inbounds = append(m.inbounds, inbound)
 	m.inboundByTag[tag] = inbound
