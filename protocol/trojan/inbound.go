@@ -181,10 +181,6 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		}
 		conn = tlsConn
 	}
-	h.userconns.Store(conn, metadata.User)
-	onClose = N.AppendClose(onClose, func(err error) {
-		h.userconns.Delete(conn)
-	})
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -206,6 +202,10 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 	} else {
 		metadata.User = user
 	}
+	h.userconns.Store(conn, user)
+	onClose = N.AppendClose(onClose, func(err error) {
+		h.userconns.Delete(conn)
+	})
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }

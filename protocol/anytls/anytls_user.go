@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"context"
 	"net"
 
 	anytls "github.com/anytls/sing-anytls"
@@ -50,4 +51,17 @@ func (h *Inbound) DelUsers(names []string) error {
 	}
 	h.service.UpdateUsers(userList)
 	return nil
+}
+
+type sessionConnKey struct{}
+
+// contextWithSessionConn carries the authenticated session connection to the stream handler,
+// so DelUsers can close the whole session instead of single streams.
+func contextWithSessionConn(ctx context.Context, conn net.Conn) context.Context {
+	return context.WithValue(ctx, sessionConnKey{}, conn)
+}
+
+func sessionConnFromContext(ctx context.Context) (net.Conn, bool) {
+	conn, loaded := ctx.Value(sessionConnKey{}).(net.Conn)
+	return conn, loaded
 }

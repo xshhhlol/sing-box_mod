@@ -117,11 +117,8 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		}
 		conn = tlsConn
 	}
-	h.userconns.Store(conn, metadata.User)
-	onClose = N.AppendClose(onClose, func(err error) {
-		h.userconns.Delete(conn)
-	})
-	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
+	err := h.service.NewConnection(adapter.WithContext(contextWithSessionConn(ctx, conn), &metadata), conn, metadata.Source, onClose)
+	h.userconns.Delete(conn)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
@@ -141,6 +138,9 @@ func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sou
 	metadata.Destination = destination.Unwrap()
 	if userName, _ := auth.UserFromContext[string](ctx); userName != "" {
 		metadata.User = userName
+		if sessionConn, loaded := sessionConnFromContext(ctx); loaded {
+			h.userconns.Store(sessionConn, userName)
+		}
 		h.logger.InfoContext(ctx, "[", userName, "] inbound connection to ", metadata.Destination)
 	} else {
 		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
