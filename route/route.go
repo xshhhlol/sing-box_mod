@@ -105,11 +105,22 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = deadline.NewConn(conn)
 	}
-	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
-	if err != nil {
-		return err
+	var (
+		selectedRule     adapter.Rule
+		buffers          []*buf.Buffer
+		selectedOutbound adapter.Outbound
+		err              error
+	)
+	if metadata.Fallback {
+		// for v2bx: fallback targets are operator configured and usually on
+		// loopback, so user route rules (e.g. ip_is_private reject) must not apply.
+		selectedOutbound = r.fallbackOutbound()
+	} else {
+		selectedRule, _, buffers, _, err = r.matchRule(ctx, &metadata, conn, nil)
+		if err != nil {
+			return err
+		}
 	}
-	var selectedOutbound adapter.Outbound
 	if selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
 		case *R.RuleActionRoute:
@@ -151,7 +162,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			return nil
 		}
 	}
-	if selectedRule == nil {
+	if selectedRule == nil && selectedOutbound == nil {
 		defaultOutbound := r.outbound.Default()
 		if !common.Contains(defaultOutbound.Network(), N.NetworkTCP) {
 			buf.ReleaseMulti(buffers)
@@ -918,6 +929,17 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 		}
 		metadata.DestinationAddresses = addresses
 		r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
+	}
+	return nil
+}
+
+// for v2bx: fallback connections leave through a direct outbound even when the
+// default outbound is a proxy that cannot reach the local fallback site.
+func (r *Router) fallbackOutbound() adapter.Outbound {
+	for _, outbound := range r.outbound.Outbounds() {
+		if outbound.Type() == C.TypeDirect && common.Contains(outbound.Network(), N.NetworkTCP) {
+			return outbound
+		}
 	}
 	return nil
 }

@@ -54,6 +54,8 @@ type InboundContext struct {
 	Destination M.Socksaddr
 	User        string
 	Outbound    string
+	// for v2bx: set on unauthenticated connections routed to a configured fallback
+	Fallback bool
 
 	// power report
 

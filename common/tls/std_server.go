@@ -99,6 +99,7 @@ type STDServerConfig struct {
 	access                sync.RWMutex
 	config                *tls.Config
 	handshakeTimeout      time.Duration
+	rejectUnknownSNI      bool
 	logger                log.Logger
 	certificateProvider   managedCertificateProvider
 	acmeService           adapter.SimpleLifecycle
@@ -499,10 +500,14 @@ func NewSTDServer(ctx context.Context, logger log.ContextLogger, options option.
 	} else {
 		handshakeTimeout = C.TCPTimeout
 	}
+	if options.RejectUnknownSNI && tlsConfig.ServerName == "" && len(tlsConfig.Certificates) == 0 {
+		return nil, E.New("reject_unknown_sni requires server_name or a certificate")
+	}
 	serverConfig := &STDServerConfig{
 		ctx:                   ctx,
 		config:                tlsConfig,
 		handshakeTimeout:      handshakeTimeout,
+		rejectUnknownSNI:      options.RejectUnknownSNI,
 		logger:                logger,
 		certificateProvider:   certificateProvider,
 		acmeService:           acmeService,
@@ -516,6 +521,11 @@ func NewSTDServer(ctx context.Context, logger log.ContextLogger, options option.
 	serverConfig.config.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
 		serverConfig.access.RLock()
 		defer serverConfig.access.RUnlock()
+		if serverConfig.rejectUnknownSNI && !isKnownServerName(serverConfig.config, info.ServerName) {
+			// Without certificates crypto/tls aborts with an unrecognized_name
+			// alert before any certificate is sent, like nginx ssl_reject_handshake.
+			return &tls.Config{}, nil
+		}
 		return serverConfig.config, nil
 	}
 	var config ServerConfig = serverConfig
@@ -557,4 +567,23 @@ func newCertificateProvider(ctx context.Context, logger log.ContextLogger, optio
 		logger:   logger,
 		provider: provider,
 	}, nil
+}
+
+func isKnownServerName(config *tls.Config, serverName string) bool {
+	if serverName == "" {
+		return false
+	}
+	if config.ServerName != "" && strings.EqualFold(config.ServerName, serverName) {
+		return true
+	}
+	for _, certificate := range config.Certificates {
+		leaf := certificate.Leaf
+		if leaf == nil && len(certificate.Certificate) > 0 {
+			leaf, _ = x509.ParseCertificate(certificate.Certificate[0])
+		}
+		if leaf != nil && leaf.VerifyHostname(serverName) == nil {
+			return true
+		}
+	}
+	return false
 }

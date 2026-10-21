@@ -3,8 +3,10 @@ package anytls
 import (
 	"context"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -21,8 +23,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	anytls "github.com/anytls/sing-anytls"
-	"github.com/anytls/sing-anytls/padding"
+	anytls "github.com/sagernet/sing-anytls"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -31,13 +32,15 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	tlsConfig tls.ServerConfig
-	router    adapter.ConnectionRouterEx
-	logger    logger.ContextLogger
-	listener  *listener.Listener
-	service   *anytls.Service
-	userconns sync.Map
-	uuidlist  []string
+	tlsConfig                tls.ServerConfig
+	router                   adapter.ConnectionRouterEx
+	logger                   logger.ContextLogger
+	listener                 *listener.Listener
+	service                  *anytls.MultiService[string]
+	fallbackAddr             M.Socksaddr
+	fallbackAddrTLSNextProto map[string]M.Socksaddr
+	userconns                sync.Map
+	uuidlist                 []string
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSInboundOptions) (adapter.Inbound, error) {
@@ -55,19 +58,68 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.tlsConfig = tlsConfig
 	}
 
-	paddingScheme := padding.DefaultPaddingScheme
+	var fallbackHandler N.TCPConnectionHandlerEx
+	if options.Fallback != nil && options.Fallback.Server != "" || len(options.FallbackForALPN) > 0 {
+		if options.Fallback != nil && options.Fallback.Server != "" {
+			inbound.fallbackAddr = options.Fallback.Build()
+			if !inbound.fallbackAddr.IsValid() {
+				return nil, E.New("invalid fallback address: ", inbound.fallbackAddr)
+			}
+		}
+		if len(options.FallbackForALPN) > 0 {
+			if inbound.tlsConfig == nil {
+				return nil, E.New("fallback for ALPN is not supported without TLS")
+			}
+			fallbackAddrNextProto := make(map[string]M.Socksaddr)
+			for nextProto, destination := range options.FallbackForALPN {
+				if destination == nil {
+					return nil, E.New("missing fallback address for ALPN ", nextProto)
+				}
+				fallbackAddr := destination.Build()
+				if !fallbackAddr.IsValid() {
+					return nil, E.New("invalid fallback address for ALPN ", nextProto, ": ", fallbackAddr)
+				}
+				fallbackAddrNextProto[nextProto] = fallbackAddr
+			}
+			inbound.fallbackAddrTLSNextProto = fallbackAddrNextProto
+		}
+		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
+	}
+
+	// An empty scheme lets the service choose: the legacy default, or a
+	// generated variable-length upload scheme when traffic shaping is enabled.
+	var paddingScheme []byte
 	if len(options.PaddingScheme) > 0 {
 		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
 	}
 
-	service, err := anytls.NewService(anytls.ServiceConfig{
-		Users: common.Map(options.Users, func(it option.AnyTLSUser) anytls.User {
-			return anytls.User(it)
-		}),
-		PaddingScheme: paddingScheme,
-		Handler:       (*inboundHandler)(inbound),
-		Logger:        logger,
+	var trafficShaping *anytls.TrafficShapingOptions
+	if options.TrafficShaping != nil && options.TrafficShaping.Enabled {
+		trafficShaping = &anytls.TrafficShapingOptions{
+			MinRecordSize:   options.TrafficShaping.MinRecordSize,
+			MaxRecordSize:   options.TrafficShaping.MaxRecordSize,
+			MinRecords:      options.TrafficShaping.MinRecords,
+			MaxRecords:      options.TrafficShaping.MaxRecords,
+			MaxPaddingBytes: options.TrafficShaping.MaxPaddingBytes,
+		}
+	}
+
+	service, err := anytls.NewMultiService[string](anytls.ServiceOptions{
+		TrafficShaping:   trafficShaping,
+		HandshakeTimeout: time.Duration(options.HandshakeTimeout),
+		PaddingScheme:    paddingScheme,
+		Handler:          (*inboundHandler)(inbound),
+		FallbackHandler:  fallbackHandler,
+		Logger:           logger,
 	})
+	if err != nil {
+		return nil, err
+	}
+	err = service.UpdateUsers(common.Map(options.Users, func(it option.AnyTLSUser) string {
+		return it.Name
+	}), common.Map(options.Users, func(it option.AnyTLSUser) string {
+		return it.Password
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +175,36 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
 	}
+}
+
+func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	var fallbackAddr M.Socksaddr
+	if len(h.fallbackAddrTLSNextProto) > 0 {
+		if tlsConn, loaded := common.Cast[tls.Conn](conn); loaded {
+			connectionState := tlsConn.ConnectionState()
+			if connectionState.NegotiatedProtocol != "" {
+				if fallbackAddr, loaded = h.fallbackAddrTLSNextProto[connectionState.NegotiatedProtocol]; !loaded {
+					h.logger.DebugContext(ctx, "process connection from ", metadata.Source, ": fallback disabled for ALPN: ", connectionState.NegotiatedProtocol)
+					N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+					return
+				}
+			}
+		}
+	}
+	if !fallbackAddr.IsValid() {
+		if !h.fallbackAddr.IsValid() {
+			h.logger.DebugContext(ctx, "process connection from ", metadata.Source, ": fallback disabled by default")
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
+		fallbackAddr = h.fallbackAddr
+	}
+	metadata.Inbound = h.Tag()
+	metadata.InboundType = h.Type()
+	metadata.Destination = fallbackAddr
+	metadata.Fallback = true
+	h.logger.InfoContext(ctx, "fallback connection to ", fallbackAddr)
+	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
 type inboundHandler Inbound

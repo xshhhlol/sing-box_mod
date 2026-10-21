@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 
-	anytls "github.com/anytls/sing-anytls"
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -12,12 +11,7 @@ func (h *Inbound) AddUsers(users []option.AnyTLSUser) error {
 	for _, user := range users {
 		h.uuidlist = append(h.uuidlist, user.Name)
 	}
-	userList := make([]anytls.User, len(h.uuidlist))
-	for i, uuid := range h.uuidlist {
-		userList[i] = anytls.User{Name: uuid, Password: uuid}
-	}
-	h.service.UpdateUsers(userList)
-	return nil
+	return h.service.UpdateUsers(h.uuidlist, h.uuidlist)
 }
 
 func (h *Inbound) DelUsers(names []string) error {
@@ -45,12 +39,7 @@ func (h *Inbound) DelUsers(names []string) error {
 	}
 
 	h.uuidlist = remaining
-	userList := make([]anytls.User, len(h.uuidlist))
-	for i, uuid := range h.uuidlist {
-		userList[i] = anytls.User{Name: uuid, Password: uuid}
-	}
-	h.service.UpdateUsers(userList)
-	return nil
+	return h.service.UpdateUsers(h.uuidlist, h.uuidlist)
 }
 
 type sessionConnKey struct{}

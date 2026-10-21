@@ -37,6 +37,9 @@ type InboundTLSOptions struct {
 
 	ECH     *InboundECHOptions     `json:"ech,omitempty"`
 	Reality *InboundRealityOptions `json:"reality,omitempty"`
+
+	// for v2bx: abort handshakes whose SNI matches neither server_name nor the certificate
+	RejectUnknownSNI bool `json:"reject_unknown_sni,omitempty"`
 }
 
 type ClientAuthType tls.ClientAuthType
