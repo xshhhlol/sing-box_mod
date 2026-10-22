@@ -164,11 +164,15 @@ func TestServiceFallbackAfterTimeout(t *testing.T) {
 					t.Fatalf("fallback got %q", data)
 				}
 			}
-			// The handshake deadline must not follow the connection.
-			time.Sleep(2 * timeout)
-			go client.Write([]byte("later"))
-			if data := readN(t, it.conn, 5); string(data) != "later" {
-				t.Fatalf("fallback got %q", data)
+			// No second read budget after an authentication timeout. The
+			// fallback sees EOF but can still send an HTTP error response.
+			one := make([]byte, 1)
+			if n, err := it.conn.Read(one); n != 0 || err != io.EOF {
+				t.Fatalf("timed-out fallback read: %d %v", n, err)
+			}
+			go it.conn.Write([]byte("reply"))
+			if data := readN(t, client, 5); string(data) != "reply" {
+				t.Fatalf("fallback reply %q", data)
 			}
 		})
 	}
@@ -188,5 +192,17 @@ func TestServiceAuthenticatedStall(t *testing.T) {
 	}
 	if len(handler) != 0 || len(fallback) != 0 {
 		t.Fatal("stalled authenticated connection was handed over")
+	}
+}
+
+func TestEarlyFallbackDoesNotRetainDeadline(t *testing.T) {
+	service, _, fallback := newTestService(t, 50*time.Millisecond)
+	client, _ := serve(t, service, []byte("GET /"))
+	it := accepted(t, fallback, time.Second)
+	readN(t, it.conn, 5)
+	time.Sleep(100 * time.Millisecond)
+	go client.Write([]byte("later"))
+	if data := readN(t, it.conn, 5); string(data) != "later" {
+		t.Fatalf("read %q", data)
 	}
 }

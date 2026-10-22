@@ -3,6 +3,7 @@ package trojan
 import (
 	"context"
 	"encoding/binary"
+	"io"
 	"net"
 	"time"
 
@@ -25,6 +26,10 @@ type Handler interface {
 // for v2bx: bounds reading the request header, see NewConnection.
 const DefaultHandshakeTimeout = 10 * time.Second
 
+// DefaultFallbackHandshakeTimeout is the initial request-header budget when a
+// web fallback is enabled. The built-in V2bX site uses the same budget.
+const DefaultFallbackHandshakeTimeout = 30 * time.Second
+
 type Service[K comparable] struct {
 	users            common.TypedValue[map[K][56]byte]
 	keys             common.TypedValue[map[[56]byte]K]
@@ -40,6 +45,9 @@ func NewService[K comparable](handler Handler, fallbackHandler N.TCPConnectionHa
 		fallbackHandler:  fallbackHandler,
 		logger:           logger,
 		handshakeTimeout: DefaultHandshakeTimeout,
+	}
+	if fallbackHandler != nil {
+		service.handshakeTimeout = DefaultFallbackHandshakeTimeout
 	}
 	service.users.Store(make(map[K][56]byte))
 	service.keys.Store(make(map[[56]byte]K))
@@ -155,7 +163,15 @@ func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	}
 	if !authenticated {
 		// The cached connection owns a reference until drained or closed.
-		cachedConn := bufio.NewCachedConn(conn, key)
+		// Authentication already exhausted the request-header budget. Replay
+		// the bytes as a finished read side so the web server can respond to
+		// the incomplete request, rather than starting a second header timer.
+		// Keep the write side open: the fallback must still deliver its reply.
+		fallbackConn := conn
+		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+			fallbackConn = &readEndedConn{Conn: conn}
+		}
+		cachedConn := bufio.NewCachedConn(fallbackConn, key)
 		key.Release()
 		return s.fallback(ctx, cachedConn, source, E.Cause(err, "bad request"), onClose)
 	}
@@ -184,6 +200,14 @@ func (s *Service[K]) fallback(ctx context.Context, conn net.Conn, source M.Socks
 	s.fallbackHandler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, onClose)
 	return nil
 }
+
+// Upstream preserves TLS/ALPN discovery through connection wrappers. Reads are
+// intentionally not replaceable: bypassing Read would restart the stalled input.
+type readEndedConn struct{ net.Conn }
+
+func (c *readEndedConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *readEndedConn) Upstream() any            { return c.Conn }
+func (c *readEndedConn) ReaderReplaceable() bool  { return false }
 
 var errNotKey = E.New("not a trojan key")
 

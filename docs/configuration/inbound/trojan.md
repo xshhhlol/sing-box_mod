@@ -53,6 +53,16 @@ TLS configuration, see [TLS](/configuration/shared/tls/#inbound).
 
 Fallback server configuration. Disabled if `fallback` and `fallback_for_alpn` are empty.
 
+
+With a fallback configured, the initial Trojan request-header timeout is 30 seconds
+(10 seconds without a fallback). A request that has already timed out is replayed
+to the fallback with its read side ended; the fallback can still write a response.
+This avoids starting another full web-header wait after authentication times out.
+Ordinary non-Trojan requests are forwarded immediately once their format rules
+out authentication. This does not add a delay to valid clients or change the wire
+format. External web servers may have different timeout and error behavior; this
+is not a guarantee of equivalence to every HTTPS server.
+
 #### fallback_for_alpn
 
 Fallback server configuration for specified ALPN.
