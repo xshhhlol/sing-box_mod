@@ -19,7 +19,6 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
-	F "github.com/sagernet/sing/common/format"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -35,7 +34,7 @@ type Inbound struct {
 	router                   adapter.ConnectionRouterEx
 	logger                   log.ContextLogger
 	listener                 *listener.Listener
-	service                  *trojan.Service[int]
+	service                  *trojan.Service[option.TrojanUser]
 	users                    []option.TrojanUser
 	tlsConfig                tls.ServerConfig
 	fallbackAddr             M.Socksaddr
@@ -95,12 +94,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
 	}
-	service := trojan.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
-	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) int {
-		return index
-	}), common.Map(options.Users, func(it option.TrojanUser) string {
-		return it.Password
-	}))
+	// for v2bx: keyed by the user itself, not its index, which shifts when
+	// users are deleted while a connection is being authenticated.
+	inbound.service = trojan.NewService[option.TrojanUser](adapter.NewUpstreamContextHandler(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
+	err := inbound.updateUsers()
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +111,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err != nil {
 		return nil, err
 	}
-	inbound.service = service
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -194,18 +190,21 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	trojanUser, loaded := auth.UserFromContext[option.TrojanUser](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
-	if user == "" {
-		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
-	}
+	user := trojanUser.Name
+	metadata.User = user
 	h.userconns.Store(conn, user)
+	// for v2bx: DelUsers updates the user list before closing tracked
+	// connections, so a user deleted before this check cannot slip through.
+	if !h.service.Contains(trojanUser) {
+		h.userconns.Delete(conn)
+		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+		return
+	}
 	onClose = N.AppendClose(onClose, func(err error) {
 		h.userconns.Delete(conn)
 	})
@@ -216,17 +215,13 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	trojanUser, loaded := auth.UserFromContext[option.TrojanUser](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
-	if user == "" {
-		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
-	}
+	user := trojanUser.Name
+	metadata.User = user
 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }

@@ -9,23 +9,12 @@ import (
 
 func (h *Inbound) AddUsers(users []option.TrojanUser) error {
 	h.users = append(h.users, users...)
-	err := h.service.UpdateUsers(common.MapIndexed(h.users, func(index int, user option.TrojanUser) int {
-		return index
-	}), common.Map(h.users, func(user option.TrojanUser) string {
-		return user.Password
-	}))
-	return err
+	return h.updateUsers()
 }
+
 func (h *Inbound) DelUsers(names []string) error {
 	nameMap := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		h.userconns.Range(func(key, value interface{}) bool {
-			if value.(string) == name {
-				key.(net.Conn).Close()
-				h.userconns.Delete(key)
-			}
-			return true
-		})
 		nameMap[name] = struct{}{}
 	}
 	filteredUsers := make([]option.TrojanUser, 0, len(h.users))
@@ -35,10 +24,21 @@ func (h *Inbound) DelUsers(names []string) error {
 		}
 	}
 	h.users = filteredUsers
-	err := h.service.UpdateUsers(common.MapIndexed(h.users, func(index int, user option.TrojanUser) int {
-		return index
-	}), common.Map(h.users, func(user option.TrojanUser) string {
+	err := h.updateUsers()
+	// Close after the update: newConnection checks the user list after
+	// tracking, so every connection of a deleted user is closed here or there.
+	h.userconns.Range(func(key, value interface{}) bool {
+		if _, found := nameMap[value.(string)]; found {
+			key.(net.Conn).Close()
+			h.userconns.Delete(key)
+		}
+		return true
+	})
+	return err
+}
+
+func (h *Inbound) updateUsers() error {
+	return h.service.UpdateUsers(h.users, common.Map(h.users, func(user option.TrojanUser) string {
 		return user.Password
 	}))
-	return err
 }
