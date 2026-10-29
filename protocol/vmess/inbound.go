@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -40,10 +42,14 @@ type Inbound struct {
 	router    adapter.ConnectionRouterEx
 	logger    logger.ContextLogger
 	listener  *listener.Listener
-	service   *vmess.Service[int]
+	service   *vmess.Service[option.VMessUser]
 	users     []option.VMessUser
 	tlsConfig tls.ServerConfig
 	transport adapter.V2RayServerTransport
+	// for v2bx
+	userconns                sync.Map
+	fallbackAddr             M.Socksaddr
+	fallbackAddrTLSNextProto map[string]M.Socksaddr
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessInboundOptions) (adapter.Inbound, error) {
@@ -66,15 +72,50 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.Transport != nil && options.Transport.Type != "" {
 		serviceOptions = append(serviceOptions, vmess.ServiceWithDisableHeaderProtection())
 	}
-	service := vmess.NewService[int](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
+	// for v2bx: probe resistance and downlink shaping, see sing-vmess docs.
+	if options.Fallback != nil && options.Fallback.Server != "" || len(options.FallbackForALPN) > 0 {
+		if options.Fallback != nil && options.Fallback.Server != "" {
+			inbound.fallbackAddr = options.Fallback.Build()
+			if !inbound.fallbackAddr.IsValid() {
+				return nil, E.New("invalid fallback address: ", inbound.fallbackAddr)
+			}
+		}
+		if len(options.FallbackForALPN) > 0 {
+			if options.TLS == nil || !options.TLS.Enabled {
+				return nil, E.New("fallback for ALPN is not supported without TLS")
+			}
+			fallbackAddrNextProto := make(map[string]M.Socksaddr)
+			for nextProto, destination := range options.FallbackForALPN {
+				if destination == nil {
+					return nil, E.New("missing fallback address for ALPN ", nextProto)
+				}
+				fallbackAddr := destination.Build()
+				if !fallbackAddr.IsValid() {
+					return nil, E.New("invalid fallback address for ALPN ", nextProto, ": ", fallbackAddr)
+				}
+				fallbackAddrNextProto[nextProto] = fallbackAddr
+			}
+			inbound.fallbackAddrTLSNextProto = fallbackAddrNextProto
+		}
+		serviceOptions = append(serviceOptions, vmess.ServiceWithFallback(adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)))
+	}
+	if options.HandshakeTimeout > 0 {
+		serviceOptions = append(serviceOptions, vmess.ServiceWithHandshakeTimeout(time.Duration(options.HandshakeTimeout)))
+	}
+	if options.RequireEncryption {
+		serviceOptions = append(serviceOptions, vmess.ServiceWithRequireEncryption())
+	}
+	if shaping := options.ResponseShaping; shaping != nil && shaping.Enabled {
+		serviceOptions = append(serviceOptions, vmess.ServiceWithResponseShaping(vmess.ResponseShapingOptions{
+			MinRecordSize: shaping.MinRecordSize,
+			MaxRecordSize: shaping.MaxRecordSize,
+			MinRecords:    shaping.MinRecords,
+			MaxRecords:    shaping.MaxRecords,
+		}))
+	}
+	service := vmess.NewService[option.VMessUser](adapter.NewUpstreamContextHandler(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
 	inbound.service = service
-	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) int {
-		return index
-	}), common.Map(options.Users, func(it option.VMessUser) string {
-		return it.UUID
-	}), common.Map(options.Users, func(it option.VMessUser) int {
-		return it.AlterId
-	}))
+	err = inbound.updateUsers()
 	if err != nil {
 		return nil, err
 	}
@@ -173,35 +214,77 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	// for v2bx: the service authenticates the user itself, not an index into
+	// h.users, which shifts when users are deleted.
+	vmessUser, loaded := auth.UserFromContext[option.VMessUser](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
-	if user == "" {
-		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
+	user := userName(vmessUser)
+	metadata.User = vmessUser.Name
+	h.userconns.Store(conn, vmessUser.Name)
+	// DelUsers updates the user list before closing tracked connections, so
+	// a user deleted before this check cannot slip through.
+	if !h.service.Contains(vmessUser) {
+		h.userconns.Delete(conn)
+		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+		return
 	}
+	onClose = N.AppendClose(onClose, func(err error) {
+		h.userconns.Delete(conn)
+	})
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+}
+
+func userName(user option.VMessUser) string {
+	if user.Name != "" {
+		return user.Name
+	}
+	return F.ToString(user.UUID)
+}
+
+func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	var fallbackAddr M.Socksaddr
+	if len(h.fallbackAddrTLSNextProto) > 0 {
+		if tlsConn, loaded := common.Cast[tls.Conn](conn); loaded {
+			connectionState := tlsConn.ConnectionState()
+			if connectionState.NegotiatedProtocol != "" {
+				if fallbackAddr, loaded = h.fallbackAddrTLSNextProto[connectionState.NegotiatedProtocol]; !loaded {
+					h.logger.DebugContext(ctx, "process connection from ", metadata.Source, ": fallback disabled for ALPN: ", connectionState.NegotiatedProtocol)
+					N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+					return
+				}
+			}
+		}
+	}
+	if !fallbackAddr.IsValid() {
+		if !h.fallbackAddr.IsValid() {
+			h.logger.DebugContext(ctx, "process connection from ", metadata.Source, ": fallback disabled by default")
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
+		fallbackAddr = h.fallbackAddr
+	}
+	metadata.Inbound = h.Tag()
+	metadata.InboundType = h.Type()
+	metadata.Destination = fallbackAddr
+	metadata.Fallback = true
+	h.logger.InfoContext(ctx, "fallback connection to ", fallbackAddr)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
 func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	userIndex, loaded := auth.UserFromContext[int](ctx)
+	vmessUser, loaded := auth.UserFromContext[option.VMessUser](ctx)
 	if !loaded {
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
-	if user == "" {
-		user = F.ToString(userIndex)
-	} else {
-		metadata.User = user
-	}
+	user := userName(vmessUser)
+	metadata.User = vmessUser.Name
 	if metadata.Destination.Fqdn == packetaddr.SeqPacketMagicAddress {
 		metadata.Destination = M.Socksaddr{}
 		conn = packetaddr.NewConn(bufio.NewNetPacketConn(conn), metadata.Destination)

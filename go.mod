@@ -206,3 +206,5 @@ require (
 )
 
 replace github.com/sagernet/sing-anytls => github.com/xshhhlol/sing-anytls v0.0.0-20261021111646-31121aa21c4e
+
+replace github.com/sagernet/sing-vmess => github.com/xshhhlol/sing-vmess v0.0.0-20261029090101-a10750ffa262
