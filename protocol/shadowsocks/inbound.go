@@ -30,6 +30,18 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksInboundOptions) (adapter.Inbound, error) {
+	if options.UDPPadding != nil && options.UDPPadding.Enabled && (!common.Contains(shadowaead_2022.List, options.Method) || len(options.Destinations) > 0) {
+		return nil, E.New("UDP padding requires an SS2022 terminating inbound")
+	}
+	if (options.Method == shadowsocks.MethodNone || len(options.Destinations) > 0) &&
+		(options.HandshakeTimeout != 0 || options.TrafficShaping != nil && options.TrafficShaping.Enabled) {
+		return nil, E.New("TCP hardening options require an encrypted Shadowsocks terminating inbound")
+	}
+	var err error
+	ctx, err = serverContext(ctx, options)
+	if err != nil {
+		return nil, err
+	}
 	if len(options.Users) > 0 && len(options.Destinations) > 0 {
 		return nil, E.New("users and destinations options must not be combined")
 	} else if options.Managed && (len(options.Users) > 0 || len(options.Destinations) > 0) {
