@@ -5,17 +5,18 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/bufio/deadline"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/rw"
 )
 
 type Handler interface {
@@ -83,18 +84,24 @@ func (s *Service[K]) Contains(user K) bool {
 
 // for v2bx: the key is read from a byte stream, independently of TLS record
 // and TCP read boundaries, and the whole request header is read under one
-// deadline that is cleared before the connection reaches the fallback or the
-// handler. Unauthenticated bytes, including a partial read ending with EOF or
-// timeout, are all replayed to the fallback.
+// deadline. Unauthenticated bytes, including a partial read ending with EOF or
+// timeout, are all replayed to the fallback, which inherits what is left of
+// that deadline until the request head is complete (see fallbackConn).
 func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(s.handshakeTimeout)
-	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
+	// WebSocket, gRPC and HTTP/2 transport connections cannot set read
+	// deadlines and fail with os.ErrInvalid; read them through a deadline
+	// reader so the handshake stays bounded instead of being refused.
+	if deadline.NeedAdditionalReadDeadline(conn) {
+		conn = deadline.NewConn(conn)
 	}
-	err := conn.SetReadDeadline(deadline)
+	headerDeadline := time.Now().Add(s.handshakeTimeout)
+	if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(headerDeadline) {
+		headerDeadline = contextDeadline
+	}
+	err := conn.SetReadDeadline(headerDeadline)
 	if err != nil {
 		return E.Cause(err, "set handshake deadline")
 	}
@@ -124,9 +131,9 @@ func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		if !loaded {
 			return false, E.New("unknown key")
 		}
-		readErr := rw.SkipN(conn, 2)
+		readErr := readCRLF(conn)
 		if readErr != nil {
-			return true, E.Cause(readErr, "skip crlf")
+			return true, readErr
 		}
 		readErr = binary.Read(conn, binary.BigEndian, &command)
 		if readErr != nil {
@@ -141,9 +148,9 @@ func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		if readErr != nil {
 			return true, E.Cause(readErr, "read destination")
 		}
-		readErr = rw.SkipN(conn, 2)
+		readErr = readCRLF(conn)
 		if readErr != nil {
-			return true, E.Cause(readErr, "skip crlf")
+			return true, readErr
 		}
 		return true, nil
 	}()
@@ -162,15 +169,12 @@ func (s *Service[K]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		return E.Cause(clearErr, "clear handshake deadline")
 	}
 	if !authenticated {
-		// The cached connection owns a reference until drained or closed.
-		// Authentication already exhausted the request-header budget. Replay
-		// the bytes as a finished read side so the web server can respond to
-		// the incomplete request, rather than starting a second header timer.
-		// Keep the write side open: the fallback must still deliver its reply.
-		fallbackConn := conn
-		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-			fallbackConn = &readEndedConn{Conn: conn}
+		fallbackConn, budgetErr := newFallbackConn(conn, key.Bytes(), headerDeadline, E.IsTimeout(err))
+		if budgetErr != nil {
+			key.Release()
+			return E.Cause(budgetErr, "set fallback deadline")
 		}
+		// The cached connection owns a reference until drained or closed.
 		cachedConn := bufio.NewCachedConn(fallbackConn, key)
 		key.Release()
 		return s.fallback(ctx, cachedConn, source, E.Cause(err, "bad request"), onClose)
@@ -201,13 +205,132 @@ func (s *Service[K]) fallback(ctx context.Context, conn net.Conn, source M.Socks
 	return nil
 }
 
-// Upstream preserves TLS/ALPN discovery through connection wrappers. Reads are
-// intentionally not replaceable: bypassing Read would restart the stalled input.
-type readEndedConn struct{ net.Conn }
+// for v2bx: fallbackConn gives the fallback what is left of the request-header
+// deadline instead of a fresh wait. A web server counts its header timeout
+// from the start of the connection; without this, a probe could send a few
+// hex digits, break the key format just before the deadline, and get a second
+// full header wait from the fallback, a timing difference to a plain server.
+//
+// Until the client completes a request head, reads stay bounded by the
+// handshake deadline. When it passes, the read side ends with EOF, as if the
+// client had stopped sending, and the write side stays open so the fallback
+// can still reply. Once the head is complete the fallback's own timeouts take
+// over, so keep-alive, uploads and HTTP/2 streams are not cut short.
+type fallbackConn struct {
+	net.Conn
+	access   sync.Mutex
+	budget   time.Time // zero once the request head is complete
+	deadline time.Time // the fallback's own read deadline
+	expired  bool
+	head     headScanner
+}
 
-func (c *readEndedConn) Read([]byte) (int, error) { return 0, io.EOF }
-func (c *readEndedConn) Upstream() any            { return c.Conn }
-func (c *readEndedConn) ReaderReplaceable() bool  { return false }
+// newFallbackConn returns conn unchanged when the replayed bytes already hold
+// a complete request head, so ordinary requests are forwarded untouched.
+func newFallbackConn(conn net.Conn, cached []byte, budget time.Time, timedOut bool) (net.Conn, error) {
+	var head headScanner
+	if !timedOut && head.scan(cached) {
+		return conn, nil
+	}
+	fallbackConn := &fallbackConn{Conn: conn, budget: budget, head: head}
+	if timedOut || !time.Now().Before(budget) {
+		fallbackConn.expired = true
+		return fallbackConn, nil
+	}
+	return fallbackConn, conn.SetReadDeadline(budget)
+}
+
+func (c *fallbackConn) Read(p []byte) (int, error) {
+	c.access.Lock()
+	expired, pending := c.expired, !c.budget.IsZero()
+	c.access.Unlock()
+	if expired {
+		return 0, io.EOF
+	}
+	n, err := c.Conn.Read(p)
+	if !pending {
+		return n, err
+	}
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.budget.IsZero() {
+		return n, err
+	}
+	if c.head.scan(p[:n]) {
+		c.budget = time.Time{}
+		if deadlineErr := c.Conn.SetReadDeadline(c.deadline); err == nil {
+			err = deadlineErr
+		}
+		return n, err
+	}
+	if E.IsTimeout(err) && (c.deadline.IsZero() || !c.deadline.Before(c.budget) || !time.Now().Before(c.budget)) {
+		c.expired = true
+		return n, io.EOF
+	}
+	return n, err
+}
+
+// SetReadDeadline keeps the budget in force while the head is incomplete: a
+// deadline set by the fallback path, or clearing it, cannot extend the wait.
+func (c *fallbackConn) SetReadDeadline(t time.Time) error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.deadline = t
+	if !c.budget.IsZero() && !c.expired && (t.IsZero() || c.budget.Before(t)) {
+		t = c.budget
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *fallbackConn) SetDeadline(t time.Time) error {
+	err := c.SetReadDeadline(t)
+	if err != nil {
+		return err
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
+// Upstream preserves TLS/ALPN discovery through connection wrappers. Reads
+// stay on this wrapper until the head is complete: bypassing it would lose the
+// EOF and let a cleared deadline restart the wait.
+func (c *fallbackConn) Upstream() any { return c.Conn }
+
+func (c *fallbackConn) ReaderReplaceable() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
+	return c.budget.IsZero() && !c.expired
+}
+
+func (c *fallbackConn) WriterReplaceable() bool { return true }
+
+// headScanner looks for the blank line that ends an HTTP/1 request head:
+// CRLF CRLF, or the bare LF LF that web servers accept as well. The HTTP/2
+// client preface contains one too.
+type headScanner uint8
+
+const (
+	headLineStart headScanner = iota + 1 // after LF
+	headLineCR                           // after LF CR
+)
+
+func (s *headScanner) scan(data []byte) bool {
+	state := *s
+	for _, c := range data {
+		switch {
+		case c == '\n' && state != 0:
+			*s = 0
+			return true
+		case c == '\n':
+			state = headLineStart
+		case c == '\r' && state == headLineStart:
+			state = headLineCR
+		default:
+			state = 0
+		}
+	}
+	*s = state
+	return false
+}
 
 var errNotKey = E.New("not a trojan key")
 

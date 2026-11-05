@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -42,7 +43,17 @@ type Inbound struct {
 	transport                adapter.V2RayServerTransport
 	references               []string
 	userconns                sync.Map
+	failures                 failureLog
+	fallbackConns            atomic.Int32
 }
+
+// for v2bx: maxFallbackConnections bounds the concurrent connections handed
+// to the fallback. They bypass per-user limits, so without a budget of their
+// own a flood of unauthenticated connections could tie up the fallback site
+// and its relays. Authenticated users never use this budget.
+const maxFallbackConnections = 1024
+
+var errFallbackBusy = E.New("too many fallback connections")
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TrojanInboundOptions) (adapter.Inbound, error) {
 	inbound := &Inbound{
@@ -175,7 +186,7 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
 		if err != nil {
 			N.CloseOnHandshakeFailure(conn, onClose, err)
-			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
+			h.failures.log(ctx, h.logger, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
 			return
 		}
 		conn = tlsConn
@@ -183,7 +194,7 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
-		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+		h.failures.log(ctx, h.logger, E.Cause(err, "process connection from ", metadata.Source))
 	}
 }
 
@@ -222,11 +233,31 @@ func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, me
 	}
 	user := trojanUser.Name
 	metadata.User = user
+	// for v2bx: tracked like TCP connections, so DelUsers also closes UDP
+	// tunnels, and checked after tracking for the same deletion race.
+	h.userconns.Store(conn, user)
+	if !h.service.Contains(trojanUser) {
+		h.userconns.Delete(conn)
+		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+		return
+	}
+	onClose = N.AppendClose(onClose, func(err error) {
+		h.userconns.Delete(conn)
+	})
 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
 func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if h.fallbackConns.Add(1) > maxFallbackConnections {
+		h.fallbackConns.Add(-1)
+		N.CloseOnHandshakeFailure(conn, onClose, errFallbackBusy)
+		h.failures.log(ctx, h.logger, E.Cause(errFallbackBusy, "process connection from ", metadata.Source))
+		return
+	}
+	onClose = N.OnceClose(N.AppendClose(onClose, func(error) {
+		h.fallbackConns.Add(-1)
+	}))
 	var fallbackAddr M.Socksaddr
 	if len(h.fallbackAddrTLSNextProto) > 0 {
 		if tlsConn, loaded := common.Cast[tls.Conn](conn); loaded {

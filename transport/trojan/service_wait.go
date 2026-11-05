@@ -7,7 +7,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/rw"
 )
 
 var _ N.PacketReadWaiter = (*PacketConn)(nil)
@@ -29,9 +28,9 @@ func (c *PacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksad
 		return nil, M.Socksaddr{}, E.Cause(err, "read chunk length")
 	}
 
-	err = rw.SkipN(c.Conn, 2)
+	err = readCRLF(c.Conn)
 	if err != nil {
-		return nil, M.Socksaddr{}, E.Cause(err, "skip crlf")
+		return nil, M.Socksaddr{}, err
 	}
 
 	buffer = c.readWaitOptions.NewPacketBuffer()

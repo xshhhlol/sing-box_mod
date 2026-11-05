@@ -55,13 +55,21 @@ Fallback server configuration. Disabled if `fallback` and `fallback_for_alpn` ar
 
 
 With a fallback configured, the initial Trojan request-header timeout is 30 seconds
-(10 seconds without a fallback). A request that has already timed out is replayed
-to the fallback with its read side ended; the fallback can still write a response.
-This avoids starting another full web-header wait after authentication times out.
-Ordinary non-Trojan requests are forwarded immediately once their format rules
-out authentication. This does not add a delay to valid clients or change the wire
-format. External web servers may have different timeout and error behavior; this
-is not a guarantee of equivalence to every HTTPS server.
+(10 seconds without a fallback). Unauthenticated bytes are replayed to the fallback,
+which inherits what is left of that deadline instead of a fresh one: until the client
+completes a request head (an empty line, as in HTTP/1, or the HTTP/2 preface), the
+fallback's read side ends when the original deadline passes, and its write side stays
+open for a response. A probe therefore cannot gain a second full web-header wait by
+choosing when to break the key format. Once the head is complete, the fallback's own
+timeouts apply, so keep-alive and uploads are unaffected. Ordinary non-Trojan requests
+are forwarded immediately once their format rules out authentication. At most 1024
+connections per inbound are handed to the fallback at once; further ones are closed.
+
+Both CRLF separators of the request header and of every UDP frame are verified.
+Repeated handshake failures are logged once a minute at error level, the rest at
+debug level. None of this adds a delay to valid clients or changes the wire format.
+External web servers may have different timeout and error behavior; this is not a
+guarantee of equivalence to every HTTPS server.
 
 #### fallback_for_alpn
 

@@ -1,7 +1,7 @@
 package trojan
 
 import (
-	"net"
+	"io"
 
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -29,7 +29,7 @@ func (h *Inbound) DelUsers(names []string) error {
 	// tracking, so every connection of a deleted user is closed here or there.
 	h.userconns.Range(func(key, value interface{}) bool {
 		if _, found := nameMap[value.(string)]; found {
-			key.(net.Conn).Close()
+			key.(io.Closer).Close()
 			h.userconns.Delete(key)
 		}
 		return true

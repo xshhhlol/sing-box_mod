@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -14,7 +15,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/rw"
 )
 
 const (
@@ -294,13 +294,27 @@ func ReadPacket(conn net.Conn, buffer *buf.Buffer) (M.Socksaddr, error) {
 		return M.Socksaddr{}, E.Cause(err, "read chunk length")
 	}
 
-	err = rw.SkipN(conn, 2)
+	err = readCRLF(conn)
 	if err != nil {
-		return M.Socksaddr{}, E.Cause(err, "skip crlf")
+		return M.Socksaddr{}, err
 	}
 
 	_, err = buffer.ReadFullFrom(conn, int(length))
 	return destination, err
+}
+
+// for v2bx: readCRLF reads a protocol separator and rejects anything but
+// CRLF. Skipping two arbitrary bytes accepted malformed requests and frames.
+func readCRLF(reader io.Reader) error {
+	var crlf [2]byte
+	_, err := io.ReadFull(reader, crlf[:])
+	if err != nil {
+		return E.Cause(err, "read crlf")
+	}
+	if crlf != [2]byte{'\r', '\n'} {
+		return E.New("bad crlf: ", hex.EncodeToString(crlf[:]))
+	}
+	return nil
 }
 
 func WritePacket(conn net.Conn, buffer *buf.Buffer, destination M.Socksaddr) error {
