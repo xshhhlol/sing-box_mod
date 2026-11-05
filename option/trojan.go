@@ -8,6 +8,8 @@ type TrojanInboundOptions struct {
 	FallbackForALPN map[string]*ServerOptions `json:"fallback_for_alpn,omitempty"`
 	Multiplex       *InboundMultiplexOptions  `json:"multiplex,omitempty"`
 	Transport       *V2RayTransportOptions    `json:"transport,omitempty"`
+	// TrustedTLSProxy accepts PROXY v2 from a local TLS terminator only.
+	TrustedTLSProxy bool `json:"trusted_tls_proxy,omitempty"`
 }
 
 type TrojanUser struct {

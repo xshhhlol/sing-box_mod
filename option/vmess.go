@@ -6,8 +6,9 @@ type VMessInboundOptions struct {
 	ListenOptions
 	Users []VMessUser `json:"users,omitempty"`
 	InboundTLSOptionsContainer
-	Multiplex *InboundMultiplexOptions `json:"multiplex,omitempty"`
-	Transport *V2RayTransportOptions   `json:"transport,omitempty"`
+	Multiplex       *InboundMultiplexOptions `json:"multiplex,omitempty"`
+	Transport       *V2RayTransportOptions   `json:"transport,omitempty"`
+	TrustedTLSProxy bool                     `json:"trusted_tls_proxy,omitempty"`
 	// for v2bx: requests that cannot be served are replayed to Fallback;
 	// without one they are drained until the handshake deadline.
 	Fallback          *ServerOptions               `json:"fallback,omitempty"`

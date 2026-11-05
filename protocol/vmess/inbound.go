@@ -3,6 +3,7 @@ package vmess
 import (
 	"context"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/tlsproxy"
 	"github.com/sagernet/sing-box/common/uot"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -50,6 +52,7 @@ type Inbound struct {
 	userconns                sync.Map
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
+	trustedTLSProxy          bool
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessInboundOptions) (adapter.Inbound, error) {
@@ -59,6 +62,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
 		users:   options.Users,
+	}
+	if options.TrustedTLSProxy {
+		if err := tlsproxy.Validate(options.Listen.Build(netip.MustParseAddr("127.0.0.1")), options.TLS != nil && options.TLS.Enabled, common.PtrValueOrDefault(options.Transport).Type); err != nil {
+			return nil, err
+		}
+		inbound.trustedTLSProxy = true
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -81,7 +90,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			}
 		}
 		if len(options.FallbackForALPN) > 0 {
-			if options.TLS == nil || !options.TLS.Enabled {
+			if (options.TLS == nil || !options.TLS.Enabled) && !inbound.trustedTLSProxy {
 				return nil, E.New("fallback for ALPN is not supported without TLS")
 			}
 			fallbackAddrNextProto := make(map[string]M.Socksaddr)
@@ -195,6 +204,16 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if h.trustedTLSProxy {
+		var alpn string
+		var err error
+		metadata.Source, alpn, err = tlsproxy.Read(conn)
+		if err != nil {
+			N.CloseOnHandshakeFailure(conn, onClose, err)
+			return
+		}
+		ctx = tlsproxy.ContextWithALPN(ctx, alpn)
+	}
 	if h.tlsConfig != nil && h.transport == nil {
 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
 		if err != nil {
@@ -248,6 +267,16 @@ func userName(user option.VMessUser) string {
 func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	var fallbackAddr M.Socksaddr
 	if len(h.fallbackAddrTLSNextProto) > 0 {
+		if h.trustedTLSProxy {
+			if alpn := tlsproxy.ALPN(ctx); alpn != "" {
+				var ok bool
+				fallbackAddr, ok = h.fallbackAddrTLSNextProto[alpn]
+				if !ok {
+					N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+					return
+				}
+			}
+		}
 		if tlsConn, loaded := common.Cast[tls.Conn](conn); loaded {
 			connectionState := tlsConn.ConnectionState()
 			if connectionState.NegotiatedProtocol != "" {

@@ -11,6 +11,7 @@ type AnyTLSInboundOptions struct {
 	HandshakeTimeout badoption.Duration           `json:"handshake_timeout,omitempty"`
 	Fallback         *ServerOptions               `json:"fallback,omitempty"`
 	FallbackForALPN  map[string]*ServerOptions    `json:"fallback_for_alpn,omitempty"`
+	TrustedTLSProxy  bool                         `json:"trusted_tls_proxy,omitempty"`
 }
 
 type AnyTLSTrafficShapingOptions struct {
