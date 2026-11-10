@@ -4,6 +4,7 @@ package tls
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -95,7 +96,19 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 	if len(privateKey) != 32 {
 		return nil, E.New("invalid private key")
 	}
-	tlsConfig.PrivateKey = privateKey
+	// Xray and sing-box can share different REALITY revisions in an embedding
+	// application. Older revisions accept raw bytes; newer ones use crypto/ecdh.
+	switch field := any(&tlsConfig.PrivateKey).(type) {
+	case *[]byte:
+		*field = privateKey
+	case **ecdh.PrivateKey:
+		*field, err = ecdh.X25519().NewPrivateKey(privateKey)
+		if err != nil {
+			return nil, E.Cause(err, "parse private key")
+		}
+	default:
+		return nil, E.New("unsupported REALITY private key type")
+	}
 	tlsConfig.MaxTimeDiff = time.Duration(options.Reality.MaxTimeDifference)
 
 	tlsConfig.ShortIds = make(map[[8]byte]bool)
