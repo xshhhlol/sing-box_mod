@@ -52,7 +52,11 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 }
 
 func (s *Server) Tun(server GunService_TunServer) error {
-	conn := NewGRPCConn(server, nil)
+	// Closing a server-side gRPC connection must let the RPC return. That
+	// return cancels Recv, which cannot be interrupted with a net.Conn deadline.
+	ctx, cancel := context.WithCancelCause(s.ctx)
+	defer cancel(nil)
+	conn := NewGRPCConn(server, cancel)
 	var source M.Socksaddr
 	if remotePeer, loaded := peer.FromContext(server.Context()); loaded {
 		source = M.SocksaddrFromNet(remotePeer.Addr)
@@ -69,10 +73,14 @@ func (s *Server) Tun(server GunService_TunServer) error {
 		}
 	}
 	done := make(chan struct{})
-	go s.handler.NewConnectionEx(log.ContextWithNewID(s.ctx), conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
+	go s.handler.NewConnectionEx(log.ContextWithNewID(ctx), conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
 		close(done)
 	}))
-	<-done
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-server.Context().Done():
+	}
 	return nil
 }
 

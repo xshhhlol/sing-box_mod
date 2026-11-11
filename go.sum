@@ -419,6 +419,8 @@ github.com/xshhhlol/sing-vmess v0.0.0-20261029090832-b7d57b1a7f7b h1:Dis2pm5vh4z
 github.com/xshhhlol/sing-vmess v0.0.0-20261029090832-b7d57b1a7f7b/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
 github.com/xshhhlol/sing-vmess v0.0.0-20261030035536-9a2d3098d4f6 h1:OKRs1IO+hFsoe5NHNDTCfDNcR/Uw3Uca04I35CcgeOk=
 github.com/xshhhlol/sing-vmess v0.0.0-20261030035536-9a2d3098d4f6/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
+github.com/xshhhlol/sing-vmess v0.0.0-20261111072605-860c876d0864 h1:TJGwZui8F99LYMEgQQpSRDhUyA3WM9keDap/+35azu8=
+github.com/xshhhlol/sing-vmess v0.0.0-20261111072605-860c876d0864/go.mod h1:dBh9luqHdu9jYY0zf0KVKmbyAEjsUj2iFINip8cFhkQ=
 github.com/xtls/reality v0.0.0-20260908045812-e1986a4d31ca h1:eugDuiZ7KGED+IFIBQIUsPJXThy+Wgp3MnroI8S11RE=
 github.com/xtls/reality v0.0.0-20260908045812-e1986a4d31ca/go.mod h1:DsJblcWDGt76+FVqBVwbwRhxyyNJsGV48gJLch0OOWI=
 github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 h1:ilQV1hzziu+LLM3zUTJ0trRztfwgjqKnBWNtSRkbmwM=
